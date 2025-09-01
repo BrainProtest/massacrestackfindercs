@@ -1,0 +1,2 @@
+- Download https://www.edsm.net/dump/systemsPopulated.json.gz
+- place extracted systemsPopulated.json into this folder

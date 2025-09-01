@@ -1,6 +1,13 @@
 # Massacre Stack Finder
 
-Tries to select 
+Tries to select good massacre stack finders via a cobbled together heuristic. 
+
+Takes into account:
+- Number of potentially mission generating factions within reach
+- Military Economy
+- Number of potential alternative targets
+
+Needs a file downloaded and passed to command execution, see [Input](./Input)
 
 ## Example Usage
 

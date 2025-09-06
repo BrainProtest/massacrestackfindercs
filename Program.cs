@@ -5,159 +5,77 @@ using System.Numerics;
 using System.Text;
 using System.Text.Json;
 using CommandLine;
+using MassacreStackFinderCs.Types;
 
 namespace MassacreStackFinderCs;
 
 internal class Program
 {
+    private static VoxelAccelerationStructure _accelerationStructure = new();
+    private static List<StarSystem> _systemsRaw = [];
+    private static List<MassacreTargetSystem> _massacreTargetSystems = [];
+
     public static Task<int> Main(string[] args)
     {
         var parserResult = CommandLine.Parser.Default.ParseArguments<CmdOptions>(args);
-        return parserResult.MapResult(options => Run(options), errs => Task.FromResult(1));
-    }
-
-    private static SemaphoreSlim consoleSemaphore { get; } = new(1, 1);
-
-    private static async Task Log(string message)
-    {
-        await consoleSemaphore.WaitAsync();
-        Console.Write(message);
-        consoleSemaphore.Release();
-    }
-
-    private static async Task ReplaceLog(string message)
-    {
-        await consoleSemaphore.WaitAsync();
-        // Console.SetCursorPosition(0, Console.CursorTop);
-        // Console.Write(new string(' ', Console.WindowWidth));
-        // Console.SetCursorPosition(0, Console.CursorTop);
-        Console.Write("\r");
-        Console.Write(message);
-        consoleSemaphore.Release();
-    }
-
-    private static Task LogLine(string message)
-    {
-        return Log($"{message}\n");
-    }
-
-    private struct LogTask : IAsyncDisposable
-    {
-        public Stopwatch Stopwatch { get; } = new();
-        public string Message { get; }
-        public long Total { get; }
-        private static long Current = 0;
-        public CancellationTokenSource CancelHost { get; } = new();
-
-        public LogTask(string message, int total)
-        {
-            Stopwatch.Start();
-            Message = message;
-            Total = total;
-        }
-
-        public static async Task<LogTask> New(string message, int total)
-        {
-            var logTask = new LogTask(message, total);
-            await logTask.Start();
-            return logTask;
-        }
-
-        public async Task Start()
-        {
-            Interlocked.Exchange(ref Current, 0);
-            await LogUpdate();
-            KickoffUpdate();
-        }
-
-        public void Increment()
-        {
-            Interlocked.Increment(ref Current);
-        }
-
-        public void Update(long current)
-        {
-            Interlocked.Exchange(ref Current, current);
-        }
-
-        public void KickoffUpdate()
-        {
-            CancellationToken token = CancelHost.Token;
-            LogTask thisLocal = this;
-            _ = Task.Run(() => thisLocal.Update(token), token);
-        }
-
-        public async Task Update(CancellationToken cancellationToken = default)
-        {
-            await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken);
-            if (!cancellationToken.IsCancellationRequested)
-            {
-                _ = Task.Run(LogUpdate, cancellationToken);
-            }
-            if (!cancellationToken.IsCancellationRequested)
-            {
-                CancellationToken token = CancelHost.Token;
-                LogTask thisLocal = this;
-                _ = Task.Run(() => thisLocal.Update(token), token);
-            }
-        }
-
-        Task LogUpdate()
-        {
-            if (Total == 0)
-            {
-                return ReplaceLog($"> {Message} {Interlocked.Read(ref Current)} ... ");
-            }
-            else
-            {
-                return ReplaceLog($"> {Message} {Interlocked.Read(ref Current)} / {Total} ... ");
-            }
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            await CancelHost.CancelAsync();
-            CancelHost.Dispose();
-            await LogUpdate();
-            await LogLine($"Done ({Stopwatch.Elapsed.TotalSeconds:F3} seconds)");
-        }
+        return parserResult.MapResult(Run, _ => Task.FromResult(1));
     }
 
     private static async Task<int> Run(CmdOptions options)
     {
         if (!options.InputFile.Exists)
         {
-            await LogLine("Input file does not exist.");
+            await StaticLog.LogLine("Input file does not exist.");
             return 1;
         }
 
         FileInfo fileToRead;
-        bool useCacheFile;
+        bool ingestCacheFile;
 
+        // Use cache if it exists and is newer than the input file (implying it was generated based on that input file)
         if (options.CacheFile.Exists && options.CacheFile.LastWriteTime > options.InputFile.LastWriteTime)
         {
             fileToRead = options.CacheFile;
-            useCacheFile = true;
+            ingestCacheFile = true;
         }
         else
         {
             fileToRead = options.InputFile;
-            useCacheFile = false;
+            ingestCacheFile = false;
         }
 
-        VoxelAccelerationStructure accelerationStructure = new();
-        List<System> systemsRaw = [];
+        await IngestSystemsFile(ingestCacheFile, fileToRead);
 
+        if (!ingestCacheFile)
         {
-            string message = $"Reading from {(useCacheFile ? "cache" : "input")} file '{fileToRead.FullName}'";
-            await using LogTask logTask =
-                await LogTask.New(message, 0);
+            await EmitSystemsCacheFile(options);
+        }
+
+        await ComputeTargetSystems();
+
+        await EmitResults(options);
+
+        return 0;
+    }
+
+    // Ingest a json file containing all systems in EDSM systemPopulated format
+    private static async Task IngestSystemsFile(bool isCacheFile, FileInfo fileToRead)
+    {
+        {
+            string message = $"Reading from {(isCacheFile ? "cache" : "input")} file '{fileToRead.FullName}'";
+            await using LogTask logTask = await LogTask.New(message, 0);
+
+            // Open the file
             await using FileStream stream = fileToRead.OpenRead();
-            IAsyncEnumerable<System?> systemStream = JsonSerializer.DeserializeAsyncEnumerable<System>(stream, JsonSerializerOptions);
-            await foreach (System? system in systemStream)
+
+            // Async enumerate all {...} system json objects
+            IAsyncEnumerable<StarSystem?> systemStream =
+                JsonSerializer.DeserializeAsyncEnumerable<StarSystem>(stream, JsonSerializerOptions);
+            await foreach (StarSystem? system in systemStream)
             {
                 if (system != null)
                 {
+                    // Prune all stations which are not of interest to us
                     for (int index = system.Stations.Count - 1; index >= 0; index--)
                     {
                         Station station = system.Stations[index];
@@ -166,85 +84,109 @@ internal class Program
                             system.Stations.RemoveAt(index);
                         }
                     }
+
+                    // Prune dead faction entries
                     for (int index = system.Factions.Count - 1; index >= 0; index--)
                     {
                         Faction faction = system.Factions[index];
-                        if (faction.Influence < 0.00001f)
+                        if (faction.IsDeadFaction)
                         {
                             system.Factions.RemoveAt(index);
                         }
                     }
 
-                    system.Register(accelerationStructure);
-                    systemsRaw.Add(system);
-                    
+                    // Register system with the acceleration structure
+                    system.Register(_accelerationStructure);
+                    // Add to the raw array
+                    _systemsRaw.Add(system);
+
                     logTask.Increment();
                 }
             }
 
-            systemsRaw.Sort(new System.IdComparer());
+            // Sort systemsRaw by Id to keep output consistent
+            _systemsRaw.Sort(new StarSystem.IdComparer());
         }
 
-        await LogLine($"Discovered {systemsRaw.Count} systems.");
+        await StaticLog.LogLine($"Discovered {_systemsRaw.Count} systems.");
+    }
 
-        if (!useCacheFile)
+    // Write a json file with an EDSM systemsPopulated-like format to use as a cache for quicker ingestion
+    private static async Task EmitSystemsCacheFile(CmdOptions options)
+    {
+        string message = $"Writing cache file '{options.CacheFile.FullName}'";
+        await using LogTask logTask = await LogTask.New(message, 0);
+
         {
-            string message = $"Writing cache file '{options.CacheFile.FullName}'";
-            await using LogTask logTask = await LogTask.New(message, 0);
-            
-            {
-                await using FileStream stream = options.CacheFile.Create();
-                await JsonSerializer.SerializeAsync(stream, systemsRaw, JsonSerializerOptionsCache);
-                logTask.Increment();
-            }
+            await using FileStream stream = options.CacheFile.Create();
+            await JsonSerializer.SerializeAsync(stream, _systemsRaw, JsonSerializerOptionsCache);
+            logTask.Increment();
         }
+    }
 
+    // Enumerates all systems and computes their viability as hunter systems
+    // Hunter System: A system which is a viable target for pirate massacre missions from surrounding systems
+    private static async Task ComputeTargetSystems()
+    {
+        await using LogTask logTask = await LogTask.New($"Evaluating Hunter Systems", _systemsRaw.Count);
 
-        List<MassacreStackSystem> massacreStackSystems = [];
+        foreach (StarSystem system in _systemsRaw)
         {
-            await using LogTask logTask = await LogTask.New($"Evaluating Hunter Systems", systemsRaw.Count);
-            foreach (System system in systemsRaw)
+            // Do some prechecks
+
+            // Must have an anarchy faction to hunt
+            bool hasAnarchyFaction = system.AnarchyFaction != null;
+            // Must have ringed bodies for RES availability
+            bool hasRingedBody = system.RingedBodies.Any();
+            // Must have nearby systems capable of generating missions
+            bool anyNearbySystems = system.EnumerateNearbySystems(10, sys => sys.MissionGiverScore > 0.0f).Any();
+
+            if (hasAnarchyFaction && hasRingedBody && anyNearbySystems)
             {
-                bool hasAnarchy = system.AnarchyFaction != null;
-                bool hasRingedBody = system.RingedBodies.Any();
-                var nearbySystems = system.EnumerateNearbySystems(10, sys => sys.MissionGiverScore > 0.0f);
-                bool anyNearbySystems = nearbySystems.Any();
-                if (hasAnarchy && hasRingedBody && anyNearbySystems)
+                MassacreTargetSystem targetSystem = new MassacreTargetSystem(system);
+                StaticScoringHeuristic.CalculateTargetSystemScore(targetSystem);
+                if (targetSystem.Score > 0.0f)
                 {
-                    MassacreStackSystem stackSystem = new MassacreStackSystem(system);
-                    if (stackSystem.Score > 0.0f)
-                    {
-                        massacreStackSystems.Add(stackSystem);
-                    }
+                    _massacreTargetSystems.Add(targetSystem);
                 }
-                logTask.Increment();
             }
-            massacreStackSystems.Sort(new MassacreStackSystem.ScoreComparer());
-            massacreStackSystems.Reverse();
-        }
-        
-        await LogLine($"Identified {massacreStackSystems.Count} stack systems");
 
-        foreach (var stackSystem in massacreStackSystems.Take(options.NumResults))
+            logTask.Increment();
+        }
+
+        // Sort descending by score
+        _massacreTargetSystems.Sort(new MassacreTargetSystem.ScoreComparer());
+    }
+
+    // Emit results to console and output files
+    private static async Task EmitResults(CmdOptions options)
+    {
+        await StaticLog.LogLine($"Identified {_massacreTargetSystems.Count} target systems");
+
+        // Log best systems
+        foreach (var stackSystem in _massacreTargetSystems.Take(options.NumResults))
         {
-            await LogLine($"{stackSystem.System.Name}: {stackSystem.Score}");
+            await StaticLog.LogLine($"{stackSystem.System.Name}: {stackSystem.Score}");
         }
 
+        // Write result files
         {
             await using LogTask logTask = await LogTask.New($"Writing out results", 0);
             if (options.OutputDir.Exists)
             {
                 options.OutputDir.Delete(true);
             }
+
             options.OutputDir.Create();
             List<Task> tasks =
             [
-
-                ..massacreStackSystems.Take(options.NumResults).Select(sys => Task.Run(async () =>
+                .._massacreTargetSystems.Take(options.NumResults).Select(sys => Task.Run(async () =>
                 {
                     await using FileStream stream =
                         new FileInfo(Path.Combine(options.OutputDir.FullName, $"{sys.Name}.json")).Create();
                     await JsonSerializer.SerializeAsync(stream, sys, JsonSerializerOptions);
+                    // Disable because we guarantee this task finishes before outer scope is exited
+                    // ReSharper disable once AccessToDisposedClosure
                     logTask.Increment();
                 })),
 
@@ -253,10 +195,13 @@ internal class Program
                     await using FileStream stream =
                         new FileInfo(Path.Combine(options.OutputDir.FullName, "_overview.txt")).Create();
                     await using StreamWriter writer = new StreamWriter(stream, Encoding.UTF8);
-                    foreach (var stackSystem in massacreStackSystems.Take(options.NumResults))
+                    foreach (var stackSystem in _massacreTargetSystems.Take(options.NumResults))
                     {
                         await writer.WriteLineAsync($"{stackSystem.System.Name}: {stackSystem.Score}");
                     }
+
+                    // Disable because we guarantee this task finishes before outer scope is exited
+                    // ReSharper disable once AccessToDisposedClosure
                     logTask.Increment();
                 })
             ];
@@ -264,25 +209,28 @@ internal class Program
             await Task.WhenAll(tasks);
         }
 
+        // Look up a specific system the user is interested in
         if (!string.IsNullOrEmpty(options.SystemOfInterest))
         {
-            MassacreStackSystem? sys = massacreStackSystems.Find(sys =>
-                string.Equals(sys.Name, options.SystemOfInterest, (StringComparison)StringComparison.OrdinalIgnoreCase));
+            MassacreTargetSystem? sys = _massacreTargetSystems.Find(sys =>
+                string.Equals(sys.Name, options.SystemOfInterest,
+                    (StringComparison)StringComparison.OrdinalIgnoreCase));
             if (sys != null)
             {
-                await using FileStream stream = new FileInfo(Path.Combine(options.OutputDir.FullName, $"{sys.Name}.json")).Create();
+                await using FileStream stream =
+                    new FileInfo(Path.Combine(options.OutputDir.FullName, $"{sys.Name}.json")).Create();
                 await JsonSerializer.SerializeAsync(stream, sys, JsonSerializerOptions);
-                await LogLine($"Emitted file for system of interest '{sys.Name}'");
+                await StaticLog.LogLine($"Emitted file for system of interest '{sys.Name}'");
             }
             else
             {
-                await LogLine($"System of interest '{options.SystemOfInterest}' not found in potential stack targets");
+                await StaticLog.LogLine(
+                    $"System of interest '{options.SystemOfInterest}' not found in potential stack targets");
             }
         }
-
-        return 0;
     }
 
+    // Default Json options for reading/writing general files
     public static JsonSerializerOptions JsonSerializerOptions { get; } = new()
     {
         WriteIndented = true,
@@ -290,6 +238,7 @@ internal class Program
         ReadCommentHandling = JsonCommentHandling.Skip
     };
 
+    // Default json options for writing the cache file
     public static JsonSerializerOptions JsonSerializerOptionsCache { get; } = new()
     {
         WriteIndented = false,

@@ -1,9 +1,11 @@
 using System.Numerics;
 using System.Security.AccessControl;
+using MassacreStackFinderCs.Types;
 
 namespace MassacreStackFinderCs;
 
-public struct VoxelCoordinate :  IEquatable<VoxelCoordinate>
+// Helper struct to identify a 3D voxel
+public struct VoxelCoordinate : IEquatable<VoxelCoordinate>
 {
     public int X { get; set; }
     public int Y { get; set; }
@@ -22,9 +24,9 @@ public struct VoxelCoordinate :  IEquatable<VoxelCoordinate>
 
     public VoxelCoordinate(Vector3 coordinate)
     {
-        X = (int)Math.Floor(coordinate.X * 0.05);
-        Y = (int)Math.Floor(coordinate.Y * 0.05);
-        Z = (int)Math.Floor(coordinate.Z * 0.05);
+        X = (int)Math.Floor(coordinate.X / VoxelAccelerationStructure.VoxelEdgeLength);
+        Y = (int)Math.Floor(coordinate.Y / VoxelAccelerationStructure.VoxelEdgeLength);
+        Z = (int)Math.Floor(coordinate.Z / VoxelAccelerationStructure.VoxelEdgeLength);
     }
 
     public bool Equals(VoxelCoordinate other)
@@ -51,121 +53,91 @@ public struct VoxelCoordinate :  IEquatable<VoxelCoordinate>
     {
         return new VoxelCoordinate(X + 1, Y + 1, Z + 1);
     }
-}
 
-public struct VoxelAccelerationStructureNode : IEquatable<VoxelAccelerationStructureNode>
-{
-    public VoxelAccelerationStructureNode()
+    public override string ToString()
     {
+        return $"({X} | {Y} | {Z})";
+    }
+    public static bool operator ==(VoxelCoordinate left, VoxelCoordinate right)
+    {
+        return left.Equals(right);
     }
 
-    public VoxelCoordinate Coordinate { get; set; }
-    public HashSet<System> Systems { get; set; } = [];
-
-    public bool Equals(VoxelAccelerationStructureNode other)
+    public static bool operator !=(VoxelCoordinate left, VoxelCoordinate right)
     {
-        return Coordinate.Equals(other.Coordinate);
+        return !(left == right);
     }
 }
 
+// Accelerates spatial lookup by organizing systems into voxel nodes
 public class VoxelAccelerationStructure
 {
-    public Dictionary<VoxelCoordinate, VoxelAccelerationStructureNode> Nodes { get; set; } = new();
+    public const int VoxelEdgeLength = 10; // Voxel size: 10/10/10 ly
 
-    public void RegisterSystem(System system)
+    // Maps coordinates to Nodes
+    // TODO: Optimization opportunity: This lookup could be faster if it would also make use of the spatial information (e.g. Octree)
+    private Dictionary<VoxelCoordinate, Node> Nodes { get; set; } = new();
+
+    /// Adds <paramref name="starSystem"/> to the acceleration structure
+    public void RegisterSystem(StarSystem starSystem)
     {
-        VoxelCoordinate coordinate = new VoxelCoordinate(system.Coords.ToVector());
+        VoxelCoordinate coordinate = new VoxelCoordinate(starSystem.Coords.ToVector());
         if (!Nodes.TryGetValue(coordinate, out var node))
         {
-            node = new VoxelAccelerationStructureNode()
+            node = new Node()
             {
                 Coordinate = coordinate,
             };
             Nodes.Add(coordinate, node);
         }
-        node.Systems.Add(system);
+
+        node.Systems.Add(starSystem);
     }
 
-    public HashSet<System> GetNearbySystems(System system, float radius, Func<System, bool>? filter = null)
+    // Enumerate systems nearby the given system within a maximum range, matching a filter   
+    public IEnumerable<StarSystem> EnumerateNearbySystems(StarSystem starSystem, float radius, Func<StarSystem, bool>? filterFunc = null)
     {
-        HashSet<System> result = [];
         float radiusSquared = radius * radius;
 
-        Vector3 center = system.Coords.ToVector();
-        VoxelCoordinate lowerBound = new VoxelCoordinate(center - new Vector3(radius)).Decrement();
-        VoxelCoordinate upperBound = new VoxelCoordinate(center + new Vector3(radius)).Increment();
+        // Identify a cube of voxels encompassing all systems which could potentially be within range. This will overestimate slightly.
+        Vector3 center = starSystem.Coords.ToVector();
+        VoxelCoordinate lowerBound = new VoxelCoordinate(center - new Vector3(radius));
+        VoxelCoordinate upperBound = new VoxelCoordinate(center + new Vector3(radius));
 
+        // Enumerate all voxels in our search cube
         for (int x = lowerBound.X; x <= upperBound.X; x++)
         {
             for (int y = lowerBound.Y; y <= upperBound.Y; y++)
             {
                 for (int z = lowerBound.Z; z <= upperBound.Z; z++)
                 {
-                    VoxelCoordinate current =  new VoxelCoordinate(x, y, z);
+                    VoxelCoordinate current = new VoxelCoordinate(x, y, z);
+
+                    // TODO: Optimization opportunity: Do a box-sphere intersection, remove any corner voxels before the costly dict lookup
+
+                    // Look up for a potential real voxel given the coordinates
                     if (Nodes.TryGetValue(current, out var node))
                     {
+                        // Enumerate systems contained in that voxel
                         foreach (var nearbySystem in node.Systems)
                         {
+                            // filter by distance
                             if (Vector3.DistanceSquared(center, nearbySystem.Coords.ToVector()) > radiusSquared)
                             {
                                 continue;
                             }
 
-                            if (filter != null)
+                            // Filter by filter function (if set)
+                            if (filterFunc != null)
                             {
-                                if (!filter(nearbySystem))
+                                if (!filterFunc(nearbySystem))
                                 {
                                     continue;
                                 }
                             }
 
-                            if (system == nearbySystem)
-                            {
-                                continue;
-                            }
-
-                            result.Add(nearbySystem);
-                        }
-                    }
-                }
-            }
-        }
-        return result;
-    }
-    
-    public IEnumerable<System> EnumerateNearbySystems(System system, float radius, Func<System, bool>? filter = null)
-    {
-        float radiusSquared = radius * radius;
-
-        Vector3 center = system.Coords.ToVector();
-        VoxelCoordinate lowerBound = new VoxelCoordinate(center - new Vector3(radius)).Decrement();
-        VoxelCoordinate upperBound = new VoxelCoordinate(center + new Vector3(radius)).Increment();
-
-        for (int x = lowerBound.X; x <= upperBound.X; x++)
-        {
-            for (int y = lowerBound.Y; y <= upperBound.Y; y++)
-            {
-                for (int z = lowerBound.Z; z <= upperBound.Z; z++)
-                {
-                    VoxelCoordinate current =  new VoxelCoordinate(x, y, z);
-                    if (Nodes.TryGetValue(current, out var node))
-                    {
-                        foreach (var nearbySystem in node.Systems)
-                        {
-                            if (Vector3.DistanceSquared(center, nearbySystem.Coords.ToVector()) > radiusSquared)
-                            {
-                                continue;
-                            }
-
-                            if (filter != null)
-                            {
-                                if (!filter(nearbySystem))
-                                {
-                                    continue;
-                                }
-                            }
-
-                            if (system == nearbySystem)
+                            // Don't yield the input system
+                            if (starSystem == nearbySystem)
                             {
                                 continue;
                             }
@@ -175,6 +147,32 @@ public class VoxelAccelerationStructure
                     }
                 }
             }
+        }
+    }
+
+    // Voxel leaf node: Set of systems
+    private struct Node : IEquatable<Node>
+    {
+        public Node()
+        {
+        }
+
+        public VoxelCoordinate Coordinate { get; set; }
+        public HashSet<StarSystem> Systems { get; set; } = [];
+
+        public bool Equals(Node other)
+        {
+            return Coordinate.Equals(other.Coordinate);
+        }
+
+        public override bool Equals(object? obj)
+        {
+            return obj is Node && Equals((Node)obj);
+        }
+
+        public override int GetHashCode()
+        {
+            return Coordinate.GetHashCode();
         }
     }
 }

@@ -1,5 +1,5 @@
 /obj/
 /bin/
 /.idea/
-.user
+*.user
 /Input/systemsPopulated.json
